@@ -1,6 +1,5 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Security, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Security, Depends, Request
 from fastapi.security.api_key import APIKeyHeader
-from pydantic import BaseModel
 import uvicorn
 import librosa
 import numpy as np
@@ -8,6 +7,7 @@ import joblib
 import base64
 import os
 import uuid
+import json
 
 # --- CONFIGURATION ---
 API_KEY_NAME = "x-api-key"
@@ -22,12 +22,6 @@ except:
     model = None
 
 app = FastAPI()
-
-# --- INPUT MODEL FOR BASE64 ---
-class AudioRequest(BaseModel):
-    audio: str  # This expects the Base64 string
-    language: str = "english"
-    format: str = "mp3"
 
 # --- AUTH ---
 async def get_api_key(api_key_header: str = Security(api_key_header)):
@@ -65,7 +59,7 @@ def extract_features(file_path):
 def predict_from_file(file_path):
     features = extract_features(file_path)
     if features is None:
-        raise HTTPException(status_code=422, detail="Could not process audio.")
+        raise HTTPException(status_code=422, detail="Could not process audio features.")
         
     features = features.reshape(1, -1)
     prediction = model.predict(features)[0]
@@ -80,7 +74,7 @@ def predict_from_file(file_path):
         "is_deepfake": prediction == "fake"
     }
 
-# --- ENDPOINT 1: FILE UPLOAD (Keep this for safety) ---
+# --- ENDPOINT 1: FILE UPLOAD (Keep for safety) ---
 @app.post("/predict-audio")
 async def predict_audio_file(file: UploadFile = File(...), api_key: str = Depends(get_api_key)):
     temp_filename = f"temp_{uuid.uuid4()}.mp3"
@@ -91,13 +85,42 @@ async def predict_audio_file(file: UploadFile = File(...), api_key: str = Depend
     finally:
         if os.path.exists(temp_filename): os.remove(temp_filename)
 
-# --- ENDPOINT 2: BASE64 JSON (For the Tester/Bot) ---
+# --- ENDPOINT 2: UNIVERSAL BASE64 HANDLER ---
+# We use 'Request' to accept ANY JSON body, avoiding 422 errors
 @app.post("/predict-base64")
-async def predict_audio_base64(request: AudioRequest, api_key: str = Depends(get_api_key)):
+async def predict_audio_base64(request: Request, api_key: str = Depends(get_api_key)):
+    try:
+        data = await request.json()
+    except:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # FIND THE BASE64 STRING
+    # The Tester might send 'audio', 'audio_base64', 'AudioBase64Format', etc.
+    # We check them all.
+    base64_str = None
+    possible_keys = ["audio", "audio_base64", "AudioBase64Format", "audioBase64Format", "audio_base64_format", "file", "data"]
+    
+    for key in possible_keys:
+        if key in data and data[key]:
+            base64_str = data[key]
+            break
+            
+    # Fallback: Check if any value looks like a long Base64 string
+    if not base64_str:
+        for key, value in data.items():
+            if isinstance(value, str) and len(value) > 500:
+                base64_str = value
+                break
+
+    if not base64_str:
+        # Print keys to logs for debugging if it fails again
+        print(f"FAILED keys received: {list(data.keys())}")
+        raise HTTPException(status_code=422, detail=f"Could not find audio data. Keys received: {list(data.keys())}")
+
     temp_filename = f"temp_{uuid.uuid4()}.mp3"
     try:
         # Decode Base64 string to audio file
-        audio_data = base64.b64decode(request.audio)
+        audio_data = base64.b64decode(base64_str)
         with open(temp_filename, "wb") as f:
             f.write(audio_data)
         return predict_from_file(temp_filename)
@@ -107,7 +130,7 @@ async def predict_audio_base64(request: AudioRequest, api_key: str = Depends(get
         if os.path.exists(temp_filename): os.remove(temp_filename)
 
 # --- HEALTH CHECK ---
-@app.get("/docs") # Keeps UptimeRobot happy
+@app.get("/docs") 
 def health_check(): return {"status": "active"}
 
 if __name__ == "__main__":
